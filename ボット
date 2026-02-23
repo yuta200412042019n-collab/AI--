@@ -1,0 +1,375 @@
+<# ============================================================
+   Gemini-Brain Discord Bot — ワンショット構築スクリプト
+   
+   【使い方】
+   1. 下の2行にあなたのキーを貼り付ける
+   2. PowerShell にスクリプト全体をコピペして Enter
+   ※ トークンが長くても安全なように .env ファイル経由で渡します
+============================================================ #>
+
+# ★★★ ここにあなたのキーを貼り付けてください ★★★
+$DISCORD_TOKEN  = "MTQ3NTA3NDE4NjY4MTUyMDE4OA.G7QAB4.Mdz-XJ7iPPQd9cdx4j15BYyH9eL7RVSNG2Qd-w
+"
+$GEMINI_API_KEY = "AIzaSyAx49_oQatcf6EOJK0SmqRW5qagDKe9sLU"
+# ★★★ 上の2行だけ編集すればOKです ★★★
+
+# --- 安全チェック ---
+if ($DISCORD_TOKEN -match "ここに" -or $GEMINI_API_KEY -match "ここに") {
+    Write-Host ""
+    Write-Host "  [ERROR] トークンが未設定です！" -ForegroundColor Red
+    Write-Host "  スクリプト冒頭の DISCORD_TOKEN と GEMINI_API_KEY を書き換えてください。" -ForegroundColor Yellow
+    Write-Host ""
+    return
+}
+
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  Gemini-Brain Discord Bot セットアップ" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+# --- 作業ディレクトリ ---
+$PROJECT_DIR = Join-Path $HOME "gemini-discord-bot"
+if (Test-Path $PROJECT_DIR) { Remove-Item $PROJECT_DIR -Recurse -Force }
+New-Item -ItemType Directory -Path $PROJECT_DIR -Force | Out-Null
+Set-Location $PROJECT_DIR
+Write-Host "[1/6] プロジェクトフォルダ作成: $PROJECT_DIR" -ForegroundColor Green
+
+# --- Python 存在チェック ---
+$pythonCmd = $null
+foreach ($cmd in @("python", "python3", "py")) {
+    try {
+        $ver = & $cmd --version 2>&1
+        if ($ver -match "Python 3") { $pythonCmd = $cmd; break }
+    } catch {}
+}
+if (-not $pythonCmd) {
+    Write-Host "[ERROR] Python 3 が見つかりません。https://python.org からインストールしてください。" -ForegroundColor Red
+    return
+}
+Write-Host "[2/6] Python 検出: $(& $pythonCmd --version)" -ForegroundColor Green
+
+# --- venv 作成 & 有効化 ---
+Write-Host "[3/6] 仮想環境を作成中..." -ForegroundColor Green
+& $pythonCmd -m venv venv
+$activateScript = Join-Path $PROJECT_DIR "venv\Scripts\Activate.ps1"
+if (-not (Test-Path $activateScript)) {
+    Write-Host "[ERROR] venv の作成に失敗しました。" -ForegroundColor Red
+    return
+}
+& $activateScript
+
+# --- pip install ---
+Write-Host "[4/6] ライブラリをインストール中 (discord.py, google-generativeai, python-dotenv)..." -ForegroundColor Green
+pip install --quiet --upgrade pip
+pip install --quiet "discord.py>=2.3" "google-generativeai>=0.5" "python-dotenv>=1.0"
+
+# --- .env ファイル生成（トークン千切れ防止の核心） ---
+Write-Host "[5/6] .env ファイルを生成中..." -ForegroundColor Green
+@"
+DISCORD_TOKEN=$DISCORD_TOKEN
+GEMINI_API_KEY=$GEMINI_API_KEY
+"@ | Set-Content -Path (Join-Path $PROJECT_DIR ".env") -Encoding UTF8
+
+# --- bot.py 生成 ---
+Write-Host "[6/6] bot.py を生成中..." -ForegroundColor Green
+
+$botCode = @'
+# -*- coding: utf-8 -*-
+"""
+Gemini-Brain Discord Bot
+- discord.py 2.x + Google Generative AI
+- 全 Intents 明示宣言済み
+- チャンネルごとに直近20件の会話履歴を保持
+"""
+
+import os
+import sys
+import traceback
+from collections import defaultdict, deque
+
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+import google.generativeai as genai
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  環境変数の読み込み
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+load_dotenv()
+
+DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+if not DISCORD_TOKEN:
+    print("[FATAL] DISCORD_TOKEN が設定されていません。")
+    sys.exit(1)
+if not GEMINI_API_KEY:
+    print("[FATAL] GEMINI_API_KEY が設定されていません。")
+    sys.exit(1)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Gemini セットアップ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+genai.configure(api_key=GEMINI_API_KEY)
+
+SYSTEM_INSTRUCTION = (
+    "あなたは Discord サーバーに常駐する優秀なAIアシスタントです。\n"
+    "日本語で簡潔かつ親切に回答してください。\n"
+    "コードブロックやマークダウンを適切に使い、読みやすい返答を心がけてください。\n"
+    "Discordのメッセージ上限(2000文字)を意識し、長くなりすぎないようにしてください。"
+)
+
+# Gemini モデル（gemini-2.0-flash を優先、なければ 1.5-flash にフォールバック）
+MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-pro"]
+model = None
+for model_name in MODEL_CANDIDATES:
+    try:
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=SYSTEM_INSTRUCTION,
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=1500,
+                temperature=0.7,
+            ),
+        )
+        # 疎通テスト
+        model.generate_content("ping")
+        print(f"[Gemini] モデル '{model_name}' を使用します。")
+        break
+    except Exception:
+        model = None
+        continue
+
+if model is None:
+    print("[FATAL] 利用可能な Gemini モデルが見つかりません。APIキーを確認してください。")
+    sys.exit(1)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  会話履歴（チャンネルごとに20件保持）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MAX_HISTORY = 20
+channel_histories: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+
+def build_prompt(channel_id: int, user_name: str, user_message: str) -> str:
+    """会話履歴を含むプロンプトを構築"""
+    history = channel_histories[channel_id]
+    lines = []
+    for role, name, text in history:
+        if role == "user":
+            lines.append(f"{name}: {text}")
+        else:
+            lines.append(f"Bot: {text}")
+    lines.append(f"{user_name}: {user_message}")
+    return "\n".join(lines)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Discord Bot セットアップ
+#  ★ Intents 完全宣言 — ここが権限エラー防止の核心
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+intents = discord.Intents.default()
+intents.message_content = True   # ← Developer Portal で有効化必須
+intents.members = True
+intents.presences = False        # 不要なので明示的に OFF
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  イベントハンドラ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@bot.event
+async def on_ready():
+    print("=" * 50)
+    print(f"  Bot ログイン成功！")
+    print(f"  ユーザー名 : {bot.user.name}")
+    print(f"  Bot ID     : {bot.user.id}")
+    print(f"  サーバー数 : {len(bot.guilds)}")
+    print("=" * 50)
+    print()
+    print("【使い方】")
+    print("  Discordの任意のチャンネルで Bot にメンション(@Bot名)するか、")
+    print("  DMを送るとGeminiが返答します。")
+    print("  !clear  → そのチャンネルの会話履歴をリセット")
+    print("  !ping   → 生存確認")
+    print()
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="メンションを待機中...",
+        )
+    )
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Bot 自身のメッセージは無視
+    if message.author.bot:
+        return
+
+    # コマンド処理を先に通す
+    await bot.process_commands(message)
+
+    # メンションされたか DM か判定
+    is_mentioned = bot.user in message.mentions
+    is_dm = isinstance(message.channel, discord.DMChannel)
+
+    if not is_mentioned and not is_dm:
+        return
+
+    # メンション文字列を除去
+    user_text = message.content
+    for mention in message.mentions:
+        user_text = user_text.replace(f"<@{mention.id}>", "")
+        user_text = user_text.replace(f"<@!{mention.id}>", "")
+    user_text = user_text.strip()
+
+    if not user_text:
+        await message.reply("何か質問を入力してください！", mention_author=False)
+        return
+
+    # Typing 表示
+    async with message.channel.typing():
+        try:
+            prompt = build_prompt(
+                message.channel.id,
+                message.author.display_name,
+                user_text,
+            )
+            response = model.generate_content(prompt)
+
+            if response and response.text:
+                reply_text = response.text
+            else:
+                # safety block 等
+                reply_text = "⚠️ 回答を生成できませんでした（安全フィルターに該当した可能性があります）。"
+
+        except Exception as e:
+            traceback.print_exc()
+            reply_text = f"⚠️ Gemini API エラー: `{type(e).__name__}: {e}`"
+
+    # 履歴に追加
+    channel_histories[message.channel.id].append(
+        ("user", message.author.display_name, user_text)
+    )
+    channel_histories[message.channel.id].append(
+        ("assistant", "Bot", reply_text[:500])  # 履歴は500文字まで
+    )
+
+    # Discord の 2000 文字制限対策：分割送信
+    for i in range(0, len(reply_text), 1990):
+        chunk = reply_text[i : i + 1990]
+        if i == 0:
+            await message.reply(chunk, mention_author=False)
+        else:
+            await message.channel.send(chunk)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  コマンド
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@bot.command(name="ping")
+async def ping_cmd(ctx: commands.Context):
+    """生存確認"""
+    latency_ms = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong!  (レイテンシ: {latency_ms}ms)")
+
+@bot.command(name="clear")
+async def clear_cmd(ctx: commands.Context):
+    """このチャンネルの会話履歴をリセット"""
+    channel_histories[ctx.channel.id].clear()
+    await ctx.send("🗑️ このチャンネルの会話履歴をリセットしました。")
+
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    """ヘルプを表示"""
+    embed = discord.Embed(
+        title="📖 Gemini Bot ヘルプ",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="💬 会話する",
+        value="Bot を @メンション して話しかけるか、DM を送ってください。",
+        inline=False,
+    )
+    embed.add_field(name="!ping",  value="生存確認",         inline=True)
+    embed.add_field(name="!clear", value="会話履歴リセット", inline=True)
+    embed.add_field(name="!help",  value="このヘルプを表示", inline=True)
+    await ctx.send(embed=embed)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  起動
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if __name__ == "__main__":
+    print("[Bot] 起動中...")
+    try:
+        bot.run(DISCORD_TOKEN, log_level=20)  # 20 = INFO
+    except discord.LoginFailure:
+        print()
+        print("[FATAL] Discord ログイン失敗！以下を確認してください：")
+        print("  1. DISCORD_TOKEN が正しいか")
+        print("  2. Developer Portal > Bot > 'MESSAGE CONTENT INTENT' が ON か")
+        print("  3. Developer Portal > Bot > 'SERVER MEMBERS INTENT' が ON か")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[FATAL] 予期しないエラー: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+'@
+
+$botCode | Set-Content -Path (Join-Path $PROJECT_DIR "bot.py") -Encoding UTF8
+
+# --- README 生成（Developer Portal の設定手順） ---
+$readmeText = @'
+# Gemini-Brain Discord Bot
+
+## Discord Developer Portal での必須設定
+
+1. https://discord.com/developers/applications にアクセス
+2. あなたの Bot アプリケーションを選択
+3. 左メニュー「Bot」をクリック
+4. 以下を **必ず ON** にする：
+   - ✅ PRESENCE INTENT（任意）
+   - ✅ SERVER MEMBERS INTENT
+   - ✅ MESSAGE CONTENT INTENT  ← **これが最重要**
+5. 左メニュー「OAuth2 > URL Generator」で Bot をサーバーに招待：
+   - Scopes: `bot`
+   - Bot Permissions: `Send Messages`, `Read Message History`, `Embed Links`
+
+## 使い方
+- Bot を @メンション して話しかける
+- DM を送る
+- `!ping`  : 生存確認
+- `!clear` : 会話履歴リセット
+- `!help`  : ヘルプ表示
+
+## 再起動するには
+```powershell
+cd ~/gemini-discord-bot
+.\venv\Scripts\Activate.ps1
+python bot.py
+```
+'@
+
+$readmeText | Set-Content -Path (Join-Path $PROJECT_DIR "README.md") -Encoding UTF8
+
+# --- 完了メッセージ ---
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  セットアップ完了！Bot を起動します..." -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  [重要] Discord Developer Portal で以下が ON か確認してください：" -ForegroundColor Yellow
+Write-Host "    - SERVER MEMBERS INTENT" -ForegroundColor Yellow
+Write-Host "    - MESSAGE CONTENT INTENT" -ForegroundColor Yellow
+Write-Host "  URL: https://discord.com/developers/applications" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  停止するには Ctrl+C を押してください。" -ForegroundColor DarkGray
+Write-Host "  再起動: cd ~/gemini-discord-bot; .\venv\Scripts\Activate.ps1; python bot.py" -ForegroundColor DarkGray
+Write-Host ""
+
+# --- Bot 起動！ ---
+& python bot.py
